@@ -33,8 +33,6 @@ import tempfile
 import time
 import hashlib
 
-from bridge import GPUAccelerator
-
 # MPS imports
 try:
     import torch
@@ -76,6 +74,120 @@ class IOProfiler:
 
 # Global I/O profiler
 io_profiler = IOProfiler()
+
+class GPUAccelerator:
+    """
+    Handles GPU acceleration for computationally intensive operations
+    using Metal Performance Shaders on Apple Silicon
+    """
+    
+    def __init__(self, use_gpu=True):
+        """Initialize GPU accelerator"""
+        self.use_gpu = use_gpu and HAS_MPS
+        self.device = None
+        
+        if self.use_gpu:
+            try:
+                self.device = torch.device("mps")
+                print(f"Using GPU acceleration with Metal Performance Shaders")
+            except Exception as e:
+                print(f"Failed to initialize MPS device: {e}")
+                self.use_gpu = False
+    
+    def compute_distances(self, traj, pairs):
+        """
+        Calculate distances between atom pairs with GPU acceleration
+        
+        Args:
+            traj: MDTraj trajectory object
+            pairs: List of atom index pairs to calculate distances for
+        
+        Returns:
+            Distances matrix with shape (n_frames, n_pairs)
+        """
+        if not self.use_gpu or self.device is None:
+            # Fall back to mdtraj implementation
+            return md.compute_distances(traj, pairs)
+        
+        try:
+            # Convert inputs to torch tensors
+            start_time = time.time()
+
+            # Extract xyz coord array from trajectory
+            xyz = traj.xyz
+            
+            # Get dimensions
+            n_frames = xyz.shape[0]
+            n_pairs = len(pairs)
+            
+            # Convert coordinates to tensor and move to GPU
+            # Using float32 for better performance on Apple Silicon
+            xyz_tensor = torch.tensor(xyz, dtype=torch.float32, device=self.device)
+            
+            # Prepare pair indices tensor
+            pair_indices = torch.tensor(pairs, dtype=torch.long, device=self.device)
+            
+            # Allocate output tensor
+            distances = torch.zeros((n_frames, n_pairs), dtype=torch.float32, device=self.device)
+            
+            # Batch processing to handle large trajectories
+            batch_size = 5000  # Adjust based on available GPU memory
+            
+            for i in range(0, n_pairs, batch_size):
+                end_idx = min(i + batch_size, n_pairs)
+                batch_pairs = pair_indices[i:end_idx]
+                
+                # Extract coordinates for atom pairs
+                atom1 = xyz_tensor[:, batch_pairs[:, 0]]
+                atom2 = xyz_tensor[:, batch_pairs[:, 1]]
+                
+                # Calculate Euclidean distances
+                # This is fully vectorized and runs efficiently on MPS
+                batch_distances = torch.sqrt(torch.sum((atom1 - atom2) ** 2, dim=2))
+                
+                # Store in output tensor
+                distances[:, i:end_idx] = batch_distances
+            
+            # Transfer back to CPU and convert to numpy
+            cpu_distances = distances.cpu().numpy()
+            
+            print(f"GPU distance calculation: {time.time() - start_time:.3f} seconds")
+            return cpu_distances
+            
+        except Exception as e:
+            print(f"GPU acceleration failed: {e}. Falling back to CPU implementation.")
+            return md.compute_distances(traj, pairs)
+    
+    def compute_contact_matrices(self, distances, threshold):
+        """
+        Calculate contact matrices from distances with GPU acceleration
+        
+        Args:
+            distances: Distance matrix with shape (n_frames, n_pairs)
+            threshold: Distance threshold for contacts
+        
+        Returns:
+            Boolean contact matrix with shape (n_frames, n_pairs)
+        """
+        if not self.use_gpu or self.device is None:
+            # CPU implementation
+            return distances < threshold
+        
+        try:
+            # Convert to tensor and move to GPU
+            distances_tensor = torch.tensor(distances, dtype=torch.float32, device=self.device)
+            
+            # Calculate contacts
+            contacts_tensor = distances_tensor < threshold
+            
+            # Transfer back to CPU
+            cpu_contacts = contacts_tensor.cpu().numpy()
+            
+            return cpu_contacts
+            
+        except Exception as e:
+            print(f"GPU contact calculation failed: {e}. Falling back to CPU.")
+            return distances < threshold
 
 class MemoryOptimizedCache:
     """Memory-optimized cache with minimal I/O operations"""
@@ -549,7 +661,7 @@ class MotifExtractor:
         
         # Initialize GPU accelerator
         self.gpu = GPUAccelerator(use_gpu=use_gpu)
-        self.use_gpu = True #self.gpu.use_gpu
+        self.use_gpu = self.gpu.use_gpu
         
         # Data structures
         self.motifs = {}
